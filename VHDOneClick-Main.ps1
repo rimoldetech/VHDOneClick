@@ -1,5 +1,5 @@
 # ============================================================
-#  MountToggle.ps1
+#  VHDOneClick-Main.ps1
 #  Mounts the VHD/VHDX found alongside this script using a
 #  differencing disk, so the original image is never modified.
 #
