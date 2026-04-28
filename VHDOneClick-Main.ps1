@@ -1,5 +1,5 @@
 # ============================================================
-#  VHDOneClick-Main.ps1
+#  MountToggle.ps1
 #  Mounts the VHD/VHDX found alongside this script using a
 #  differencing disk, so the original image is never modified.
 #
@@ -111,11 +111,26 @@ if (Test-Path $DiffPath) {
     }
 }
 
-# -- Discover disk number ------------------------------------------------------
-$DiskNumber = (Get-DiskImage -ImagePath $DiffPath).Number
+# -- Wait for the disk image to fully attach -----------------------------------
+#    Mount-DiskImage can return before Windows has finished processing the
+#    mount internally. Poll until Attached is True and Number is populated.
+Write-Host " Waiting for disk to attach..." -ForegroundColor DarkGray
+
+$DiskImage  = $null
+$DiskNumber = $null
+$Retries    = 20
+
+for ($i = 0; $i -lt $Retries; $i++) {
+    Start-Sleep -Seconds 1
+    $DiskImage = Get-DiskImage -ImagePath $DiffPath -ErrorAction SilentlyContinue
+    if ($DiskImage -and $DiskImage.Attached -and $null -ne $DiskImage.Number) {
+        $DiskNumber = $DiskImage.Number
+        break
+    }
+}
 
 if ($null -eq $DiskNumber) {
-    Write-Host " [ERROR] Could not determine disk number after mounting." -ForegroundColor Red
+    Write-Host " [ERROR] Disk did not attach within the expected time." -ForegroundColor Red
     Dismount-DiskImage -ImagePath $DiffPath -ErrorAction SilentlyContinue
     Write-Host ""
     pause
@@ -126,7 +141,6 @@ if ($null -eq $DiskNumber) {
 Write-Host " Waiting for Windows to assign drive letters..." -ForegroundColor DarkGray
 
 $TargetDrive = $null
-$Retries     = 15
 
 for ($i = 0; $i -lt $Retries; $i++) {
     Start-Sleep -Seconds 1
@@ -188,13 +202,16 @@ if (-not ($TargetDrive -and $TargetDrive.DriveLetter -match '[A-Z]')) {
 
 $DriveLetter = $TargetDrive.DriveLetter
 
-# -- Fix NTFS permissions (first run only, diff not yet present) ---------------
-#    Checks for a sentinel file written after a successful permission pass.
+# -- Fix NTFS permissions (first run only) -------------------------------------
+#    takeown claims ownership of each item first so that icacls can then
+#    actually override the original machine's SIDs. Without takeown the
+#    grant ACE is added but the original owner SID still wins.
 #    Using the Administrators SID (*S-1-5-32-544) works on all Windows locales.
 $SentinelPath = Join-Path $VHDFile.DirectoryName ($DiffName + '.perms_done')
 
 if (-not (Test-Path $SentinelPath)) {
-    Write-Host " Unlocking folders (first-run only, may take a while)..." -ForegroundColor DarkGray
+    Write-Host " Unlocking folders (first-run only, may take a moment)..." -ForegroundColor DarkGray
+    & takeown /f "${DriveLetter}:\Users" /r /d y 2>&1 | Out-Null
     & icacls "${DriveLetter}:\Users" /grant "*S-1-5-32-544:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
     New-Item -Path $SentinelPath -ItemType File -Force | Out-Null
 }
