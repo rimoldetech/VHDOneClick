@@ -31,11 +31,20 @@ $DiffPath  = Join-Path $VHDFile.DirectoryName $DiffName
 Write-Host ""
 Write-Host " Image  : $($VHDFile.Name)" -ForegroundColor Cyan
 
+# Helper: get all currently ready fixed drives via Win32 API directly.
+# This bypasses the PowerShell Storage CIM layer entirely and reflects
+# exactly what Disk Management sees.
+function Get-ReadyDriveLetters {
+    [System.IO.DriveInfo]::GetDrives() |
+        Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
+        Select-Object -ExpandProperty Name  # returns 'C:', 'D:' etc.
+}
+
 # -- State: diff exists --------------------------------------------------------
 if (Test-Path $DiffPath) {
     $DiffStatus = Get-DiskImage -ImagePath $DiffPath -ErrorAction SilentlyContinue
 
-    # State: mounted -> unmount (keep the diff disk for next time)
+    # State: mounted -> unmount, keep diff for next time
     if ($DiffStatus -and $DiffStatus.Attached) {
         Write-Host " Status : Mounted -> Unmounting..." -ForegroundColor Yellow
         try {
@@ -50,12 +59,14 @@ if (Test-Path $DiffPath) {
         exit 0
     }
 
-    # State: diff exists but not mounted -> skip creation and permission fix
+    # State: diff exists but unmounted -> mount only
     Write-Host " Diff   : Existing diff disk found - skipping setup." -ForegroundColor DarkGray
     Write-Host " Status : Not mounted -> Mounting..." -ForegroundColor Cyan
 
+    $DrivesBefore = Get-ReadyDriveLetters
+
     try {
-        Mount-DiskImage -ImagePath $DiffPath | Out-Null
+        Mount-DiskImage -ImagePath $DiffPath -ErrorAction Stop | Out-Null
     } catch {
         Write-Host " [ERROR] Failed to mount: $_" -ForegroundColor Red
         Write-Host ""
@@ -65,7 +76,7 @@ if (Test-Path $DiffPath) {
 
 } else {
 
-    # -- State: no diff disk -> first run, full setup --------------------------
+    # -- State: no diff -> first run, full setup --------------------------------
     Write-Host " Status : First run - creating differencing disk..." -ForegroundColor Cyan
 
     $DiffCreated = $false
@@ -100,8 +111,10 @@ if (Test-Path $DiffPath) {
 
     Write-Host " Mounting..." -ForegroundColor Cyan
 
+    $DrivesBefore = Get-ReadyDriveLetters
+
     try {
-        Mount-DiskImage -ImagePath $DiffPath | Out-Null
+        Mount-DiskImage -ImagePath $DiffPath -ErrorAction Stop | Out-Null
     } catch {
         Write-Host " [ERROR] Failed to mount: $_" -ForegroundColor Red
         Remove-Item $DiffPath -ErrorAction SilentlyContinue
@@ -111,9 +124,7 @@ if (Test-Path $DiffPath) {
     }
 }
 
-# -- Wait for the disk image to fully attach -----------------------------------
-#    Mount-DiskImage can return before Windows has finished processing the
-#    mount internally. Poll until Attached is True and Number is populated.
+# -- Poll until the disk is fully attached -------------------------------------
 Write-Host " Waiting for disk to attach..." -ForegroundColor DarkGray
 
 $DiskImage  = $null
@@ -137,76 +148,97 @@ if ($null -eq $DiskNumber) {
     exit 1
 }
 
-# -- Wait for Windows to finish assigning drive letters ------------------------
+# -- Poll for new drive letters using Win32 API --------------------------------
+#    Compare against the pre-mount snapshot. DriveInfo.GetDrives() calls
+#    GetLogicalDrives() directly -- the same source as Disk Management.
 Write-Host " Waiting for Windows to assign drive letters..." -ForegroundColor DarkGray
 
 $TargetDrive = $null
 
 for ($i = 0; $i -lt $Retries; $i++) {
     Start-Sleep -Seconds 1
-    $TargetDrive = Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue |
-                       Where-Object { $_.DriveLetter -match '[A-Z]' } |
-                       Sort-Object  Size -Descending |
-                       Select-Object -First 1
-    if ($TargetDrive) { break }
-}
-
-# -- Auto-assign a letter if Windows did not give one --------------------------
-if (-not $TargetDrive) {
-    Write-Host " No letter auto-assigned - attempting manual assignment..." -ForegroundColor Yellow
-
-    $SkipTypes = @(
-        '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}',  # EFI System
-        '{e3c9e316-0b5c-4db8-817d-f92df00215ae}',  # MSR
-        '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'   # Windows Recovery
-    )
-
-    $LargestUnlettered = Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue |
-        Where-Object { $SkipTypes -notcontains $_.GptType } |
-        Where-Object { $_.Size -gt 100MB } |
-        Sort-Object Size -Descending |
-        Select-Object -First 1
-
-    if ($LargestUnlettered) {
-        $UsedLetters = (Get-PSDrive -PSProvider FileSystem).Name
-        $FreeLetter  = [char[]]([int][char]'D'..[int][char]'Z') |
-                           Where-Object { $UsedLetters -notcontains $_ } |
-                           Select-Object -First 1
-
-        if ($FreeLetter) {
-            try {
-                Set-Partition -DiskNumber $DiskNumber `
-                              -PartitionNumber $LargestUnlettered.PartitionNumber `
-                              -NewDriveLetter $FreeLetter
-                Start-Sleep -Seconds 1
-                $TargetDrive = Get-Partition -DiskNumber $DiskNumber `
-                                   -PartitionNumber $LargestUnlettered.PartitionNumber
-                Write-Host " Assigned drive letter ${FreeLetter}: manually." -ForegroundColor Green
-            } catch {
-                Write-Host " [ERROR] Could not assign drive letter: $_" -ForegroundColor Red
-            }
-        } else {
-            Write-Host " [ERROR] No free drive letters available (D-Z all in use)." -ForegroundColor Red
-        }
-    } else {
-        Write-Host " [ERROR] No suitable data partition found to assign a letter to." -ForegroundColor Red
+    $NewDrives = [System.IO.DriveInfo]::GetDrives() |
+        Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
+        Where-Object { $DrivesBefore -notcontains $_.Name } |
+        Sort-Object TotalSize -Descending
+    if ($NewDrives) {
+        $TargetDrive = $NewDrives | Select-Object -First 1
+        break
     }
 }
 
-if (-not ($TargetDrive -and $TargetDrive.DriveLetter -match '[A-Z]')) {
+# -- Fallback: assign a letter via diskpart if nothing appeared ----------------
+#    Used in environments where Windows skips auto-assignment entirely.
+if (-not $TargetDrive) {
+    Write-Host " No letter auto-assigned - attempting manual assignment via diskpart..." -ForegroundColor Yellow
+
+    $UsedLetters = [System.IO.DriveInfo]::GetDrives() | Select-Object -ExpandProperty Name |
+        ForEach-Object { $_[0] }  # 'C:' -> 'C'
+    $FreeLetter = [char[]]([int][char]'D'..[int][char]'Z') |
+        Where-Object { $UsedLetters -notcontains $_ } |
+        Select-Object -First 1
+
+    if ($FreeLetter) {
+        # Use diskpart to select the disk and assign - works even when
+        # the Storage CIM layer cannot see the partitions.
+        $DpScript = @"
+select disk $DiskNumber
+list partition
+"@
+        $DpFile  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.txt')
+        [System.IO.File]::WriteAllText($DpFile, $DpScript, [System.Text.Encoding]::ASCII)
+        $DpOut   = & diskpart /s $DpFile 2>&1
+        Remove-Item $DpFile -ErrorAction SilentlyContinue
+
+        # Parse diskpart output to find the largest Primary partition
+        $PartLines = $DpOut | Where-Object { $_ -match 'Partition\s+\d+\s+Primary' }
+        $BestPart  = $PartLines | ForEach-Object {
+            if ($_ -match 'Partition\s+(\d+)\s+Primary\s+(\d+)\s*(\w+)') {
+                $mult = switch ($Matches[3]) { 'GB' {1GB} 'MB' {1MB} default {1KB} }
+                [PSCustomObject]@{ Num = [int]$Matches[1]; Bytes = [int]$Matches[2] * $mult }
+            }
+        } | Sort-Object Bytes -Descending | Select-Object -First 1
+
+        if ($BestPart) {
+            $DpAssign = @"
+select disk $DiskNumber
+select partition $($BestPart.Num)
+assign letter=$FreeLetter
+"@
+            $DpFile2 = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.txt')
+            [System.IO.File]::WriteAllText($DpFile2, $DpAssign, [System.Text.Encoding]::ASCII)
+            & diskpart /s $DpFile2 2>&1 | Out-Null
+            Remove-Item $DpFile2 -ErrorAction SilentlyContinue
+
+            Start-Sleep -Seconds 2
+            $Candidate = [System.IO.DriveInfo]::GetDrives() |
+                Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady -and $_[0] -eq $FreeLetter }
+            if ($Candidate) {
+                $TargetDrive = $Candidate
+                Write-Host " Assigned drive letter ${FreeLetter}: manually." -ForegroundColor Green
+            } else {
+                Write-Host " [ERROR] Letter assigned but drive not accessible." -ForegroundColor Red
+            }
+        } else {
+            Write-Host " [ERROR] No Primary partition found on disk $DiskNumber." -ForegroundColor Red
+        }
+    } else {
+        Write-Host " [ERROR] No free drive letters available (D-Z all in use)." -ForegroundColor Red
+    }
+}
+
+if (-not $TargetDrive) {
     Dismount-DiskImage -ImagePath $DiffPath -ErrorAction SilentlyContinue
     Write-Host ""
     pause
     exit 1
 }
 
-$DriveLetter = $TargetDrive.DriveLetter
+$DriveLetter = $TargetDrive.Name[0]  # 'E:' -> 'E'
 
 # -- Fix NTFS permissions (first run only) -------------------------------------
-#    takeown claims ownership of each item first so that icacls can then
-#    actually override the original machine's SIDs. Without takeown the
-#    grant ACE is added but the original owner SID still wins.
-#    Using the Administrators SID (*S-1-5-32-544) works on all Windows locales.
+#    takeown claims ownership so icacls can override the original machine's SIDs.
+#    Sentinel file prevents this re-running on subsequent mounts.
 $SentinelPath = Join-Path $VHDFile.DirectoryName ($DiffName + '.perms_done')
 
 if (-not (Test-Path $SentinelPath)) {
@@ -218,7 +250,7 @@ if (-not (Test-Path $SentinelPath)) {
 
 # -- Open Explorer -------------------------------------------------------------
 $DrivePath = "${DriveLetter}:\"
-$SizeGB    = [math]::Round($TargetDrive.Size / 1GB, 1)
+$SizeGB    = [math]::Round($TargetDrive.TotalSize / 1GB, 1)
 Write-Host " Opened : $DrivePath ($SizeGB GB - largest volume)" -ForegroundColor Green
 Write-Host ""
 Start-Process explorer.exe $DrivePath
