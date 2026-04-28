@@ -116,4 +116,4 @@ Delete the `.diff.vhdx.perms_done` sentinel file and the `.diff.vhdx` differenci
 
 ## License
 
-MIT — do whatever you like with it.
+[GNU General Public License v3.0](LICENSE)
