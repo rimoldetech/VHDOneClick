@@ -6,7 +6,8 @@ param([string]$Root = '.')
 
 $problems = New-Object System.Collections.Generic.List[string]
 
-$files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1 |
+$files = @(Get-ChildItem -LiteralPath $Root -Recurse -File |
+    Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' } |
     Where-Object { $_.FullName -notmatch '[\\/](build|out|\.git)[\\/]' })
 
 foreach ($f in $files) {
