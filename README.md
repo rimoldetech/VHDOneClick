@@ -1,118 +1,187 @@
 # VHDOneClick
 
-A lightweight, end-user-friendly tool for mounting VHD/VHDX disk images and browsing their contents in Windows Explorer. Designed with converted Macrium Reflect X full-disk backups in mind, where the image contains multiple partitions (EFI, MSR, Recovery, and the main Windows volume).
+VHDOneClick mounts a VHD/VHDX disk image, usually a converted Macrium Reflect full-disk backup, and opens it in Explorer with the user folders unlocked, for anyone handing a backup to someone who needs files off it.
 
-Double-click to mount. Double-click again to unmount. That's it.
+Double-click to mount. Double-click again to unmount.
 
----
+The original image is never written. Everything goes into a differencing disk next to it.
 
-## Use Case
+## What it does
 
-When you hand a VHD/VHDX backup image off to someone for file recovery, they typically have no idea how to mount it, navigate Disk Management, or deal with the fact that a full-disk image contains several partitions. VHDOneClick handles all of that automatically:
+- Creates a differencing disk (`<image>.diff.vhdx`, or `.diff.vhd` for a `.vhd`) and mounts that instead of the image.
+- Finds the right volume: the one with `\Windows\System32`, else one with `\Users`, else the largest.
+- Grants the person at the keyboard access to every profile under `\Users`, so Explorer opens them without the "You don't currently have permission" prompt.
+- Assigns a drive letter itself if Windows does not.
+- Sets the image file read-only so it does not get edited by accident.
+- Writes a log next to the image every run.
 
-- Creates a **differencing disk** so the original image is never modified
-- Identifies the correct volume (the largest data partition, equivalent to the source `C:` drive) and opens it directly in Explorer
-- Fixes NTFS ownership and permissions on first run so protected folders like `Users` are accessible without prompts
-- If Windows doesn't auto-assign a drive letter, the tool assigns one itself
-- Running it a second time cleanly unmounts the image
-
----
-
-## Contents
-
-| File | Description |
-|---|---|
-| `VHDOneClick-Entrypoint.bat` | Entry point. Checks for Administrator rights and launches the PowerShell script. |
-| `VHDOneClick-Main.ps1` | Core logic. Handles diff disk creation, mounting, drive letter detection, permission fixing, Explorer launch, and unmounting. |
-
----
-
-## Requirements
+## Prerequisites
 
 - Windows 10 or Windows 11
-- PowerShell 5.1 (built into Windows — no install required)
-- Administrator rights (required by Windows to mount disk images)
-
----
+- Windows PowerShell 5.1, which ships with Windows
+- Administrator rights, since Windows only lets admins mount disk images
 
 ## Usage
 
-### Scripts only
+### The exe (recommended)
 
-1. Place `VHDOneClick-Entrypoint.bat` and `VHDOneClick-Main.ps1` in the same folder as your `.vhd` or `.vhdx` file.
+1. Download `VHDOneClick.exe` from the latest release and check it against `SHA256SUMS.txt` (see "Verifying a download" below).
+2. Put `VHDOneClick.exe` in the same folder as the `.vhd` or `.vhdx`.
+3. Double-click it and accept the UAC prompt.
+4. If the folder has more than one image, pick one from the numbered list.
+5. Explorer opens on the image's main volume once everything is finished. The first mount for a user takes longer, since that is when access gets granted.
+6. Double-click it again to unmount.
+
+### The scripts
+
+For people who will not run an unsigned exe, `VHDOneClick-scripts.zip` on each release has the same logic as plain files.
+
+1. Unzip `VHDOneClick-Entrypoint.bat` and `VHDOneClick-Main.ps1` into the image folder.
 2. Right-click `VHDOneClick-Entrypoint.bat` and choose **Run as administrator**.
-3. On first run, a differencing disk is created and NTFS permissions are fixed — this may take a moment depending on how many files are in the image.
-4. An Explorer window will open to the main volume automatically.
-5. To unmount, run `VHDOneClick-Entrypoint.bat` as administrator again.
+3. Everything else works the same as the exe. Parameters go after the batch file name: `VHDOneClick-Entrypoint.bat -Deep`.
 
-### Pre-built release (VHDOneClick.exe)
+Or from an elevated PowerShell, wherever the script is:
 
-1. Place `VHDOneClick.exe` in the same folder as your `.vhd` or `.vhdx` file.
-2. Double-click it. The UAC elevation prompt is handled automatically.
-3. Mount and unmount work the same way as above.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\VHDOneClick-Main.ps1 -Image D:\Backups\laptop.vhdx
+```
 
----
+## Parameters
 
-## How It Works
+No parameters is the normal path: mount if unmounted, unmount if mounted.
 
-**Differencing disk**
+| Parameter | What it does |
+|---|---|
+| `-Image <path>` | Use this image instead of scanning the tool's folder. |
+| `-Mount` | Mount only. If already mounted, re-check permissions and open Explorer. |
+| `-Unmount` | Unmount only. |
+| `-Reset` | Unmount, delete the diff, create a fresh one and mount it. Use after the image file changed. |
+| `-GrantAllUsers` | Also grant `BUILTIN\Users`, for shared bench machines where several accounts need in. |
+| `-Access F\|M\|RX` | Access level granted. Default `F` (full), since writes land in a throwaway diff. |
+| `-Deep` | Recursive grant over every file in every profile, four profiles at a time. Slower, for when you want certainty. |
+| `-ClearReadOnly` | Clear the read-only flag the tool set on the image, then exit. |
+| `-Sid <SID>` | Grant this SID instead of the detected user. Mostly for testing. |
+| `-ShowVersion` | Print the version and exit. |
 
-Rather than mounting the original image directly, VHDOneClick creates a child differencing disk (`.diff.vhdx`) alongside the source file. All writes — including NTFS permission changes — land in the diff disk. The original image is never opened for writing. The diff disk is kept between sessions so subsequent mounts are fast.
+Examples with the exe, from an elevated prompt:
 
-**Finding the right volume**
+```
+VHDOneClick.exe -Image E:\client\backup.vhdx
+VHDOneClick.exe -Reset
+VHDOneClick.exe -Mount -GrantAllUsers -Access RX
+```
 
-Full-disk images from tools like Macrium Reflect contain every partition from the source drive: EFI System, Microsoft Reserved (MSR), Recovery, and the main Windows data partition. VHDOneClick detects new drive letters by comparing a snapshot of all mounted volumes taken before and after the mount call, using the Win32 `GetLogicalDrives` API directly. This bypasses the PowerShell Storage CIM layer, which can have visibility gaps with differencing disks on some machines. The largest newly appeared volume is selected as the target.
+PS2EXE reserves `-?`, `-debug`, `-extract`, `-wait` and `-end` on the exe itself. None of the tool's parameters collide with them.
 
-**Drive letter assignment**
+Exit codes: `0` success, `1` error, `2` mounted but some permissions failed, `3` the volume is BitLocker-locked.
 
-Windows usually assigns drive letters automatically. If it doesn't, VHDOneClick uses `diskpart` to identify the largest Primary partition and assign the next available letter from D onwards. Like the permission changes, this assignment exists only in Windows' own mount table and does not affect the image file.
+## How it works
 
-**Permission fixing**
+**Differencing disk.** All writes, permission changes included, land in `<image>.diff.vhdx`. The diff is kept between runs, so later mounts are fast. Delete it any time; the next run makes a new one and redoes the permission pass.
 
-Backup images preserve the original machine's NTFS security descriptors, meaning protected folders like `Users` appear locked when accessed from a different machine. On first run, VHDOneClick runs `takeown` to transfer ownership of the `Users` tree to the local Administrators group, then `icacls` to grant full access. Both operations write only to the differencing disk. A small sentinel file (`.diff.vhdx.perms_done`) is written alongside the diff when this completes, so the process is skipped on all subsequent mounts.
+**Which user gets access.** The tool finds `explorer.exe` in its own session and grants its owner. That is right when a standard user elevates with a separate admin account: the standard user is the one browsing. If no Explorer is running, it grants the account running the tool.
 
----
+**Why the old version failed.** It granted `BUILTIN\Administrators`, which images already had. Explorer runs non-elevated, and in a non-elevated token Administrators is deny-only, so that grant did nothing for browsing. v2 grants the actual user's SID.
 
-## Files Created Alongside the Image
+**The permission pass.** On each profile root (`X:\Users\<name>`) it adds one inheritable ACE for the user and lets Windows propagate it to children that inherit. Then it walks the first three folder levels of each profile and checks each folder with `Get-Acl`. Folders with protected ACLs (inheritance turned off) get a recursive grant on that subtree only. If `icacls` hits access denied, it runs `takeown /a` on that one folder and retries once. `-Deep` skips the walk and does the full recursive grant instead.
 
-After first run, VHDOneClick will leave two small sidecar files next to your `.vhdx`:
+**Links are never followed.** Profiles contain junctions like `Application Data` that point at absolute paths such as `C:\Users\<name>\AppData\Roaming`. On your machine, `C:` is your own drive. Every `icacls` call passes `/L` so it acts on the link and not its target, enumeration skips reparse points, `takeown` never recurses, and any path that does not start with the mounted drive letter is refused. The old version could change host ACLs when usernames matched.
+
+**State marker.** When the pass finishes with no failures, the tool writes `X:\.vhdoneclick.json` (Hidden, not System) inside the mounted volume. It records which SIDs were granted, at what level, when, and on which machine. It lives in the diff, so deleting the diff also forgets it. Carry the image and diff to another machine and the new user gets granted without redoing the first one. Any failure leaves the user marked incomplete, so the next mount retries.
+
+**Logs.** Each run writes `VHDOneClick-logs\<image>-<yyyyMMdd-HHmmss>.log` next to the image, keeping the 10 newest per image. If that folder is not writable, logs go to `%TEMP%\VHDOneClick-logs` and the console says so. Logs hold paths and error codes, never file contents.
+
+**Image protection.** Before creating or attaching the diff, the tool sets the read-only attribute on the image, since writing to a parent breaks every diff built on it. This is a speed bump. Explorer still lets someone delete the file after a prompt. A failure to set it (exFAT, network share) is a warning only. The tool never clears it on its own; `-ClearReadOnly` does.
+
+**Drive letters.** The tool takes a snapshot of drive letters before attaching and compares after, using the Win32 drive list directly, polling every 200 ms. If Windows assigns no letter (automount disabled), it uses `diskpart` to give the largest Primary partition the next free letter from D up.
+
+**Mounting on the machine the image came from.** The original disk is still attached, so Windows takes the diff offline with a signature collision. The tool gives the diff a new disk GUID (GPT) or signature (MBR) and brings it online. That change lands in the diff only.
+
+## Files created next to the image
 
 | File | Purpose |
 |---|---|
-| `<imagename>.diff.vhdx` | Differencing disk. Keeps permission changes and speeds up subsequent mounts. Safe to delete — it will be recreated on next run, but the permission fix will need to run again. |
-| `<imagename>.diff.vhdx.perms_done` | Sentinel flag. Prevents the `takeown`/`icacls` pass from re-running unnecessarily. Delete this alongside the diff if you need to force a permission reset. |
+| `<image>.diff.vhdx` (or `.diff.vhd`) | Differencing disk. Holds every change, including the permission grants and the marker. Safe to delete. |
+| `VHDOneClick-logs\` | Run logs, 10 newest per image. |
 
----
+v1 left a `<image>.diff.vhdx.perms_done` file. v2 ignores it, so delete it. If you have a `.vhd` image, v1 also made a `.diff.vhdx` for it; v2 uses `.diff.vhd` and says so in the console. Delete the old one.
 
-## Building the SFX (for contributors)
+## Performance
 
-The release `VHDOneClick.exe` is a WinRAR self-extracting archive configured as follows:
+v1 ran `takeown /r` and `icacls /T` over the whole `Users` tree, rewriting the owner and DACL of every file. Each one dirties an MFT record, so a big profile took minutes and bloated the diff. v2 writes profile roots, lets inheritance do the rest, and recurses only into subtrees that fail the check.
 
-- **Files to pack:** `VHDOneClick-Entrypoint.bat`, `VHDOneClick-Main.ps1`
-- **Run after extraction:** `VHDOneClick-Entrypoint.bat`
-- **Request administrative privileges:** Yes
-- **Overwrite mode:** Overwrite all files (so re-running always uses the latest scripts)
+Measured numbers go here once they exist. Nothing is measured yet, so treat "much faster on big profiles" as an estimate.
 
----
+| Case | First run | Diff growth |
+|---|---|---|
+| 500,000-file profile, default | not measured | not measured |
+| 500,000-file profile, `-Deep` | not measured | not measured |
+| Remount of an existing diff | not measured (target: under 5 s) | none |
+
+## Security notes
+
+- **Do not run anything from the mounted volume.** If the image came from someone else, treat it as untrusted. Opening it at all means Windows' NTFS driver parses data someone else controls.
+- **Loose scripts are tamperable.** The tool runs elevated. If you use the `.ps1` and `.bat` from a folder other people can write to, someone could swap them. The exe embeds the script, so this applies to the scripts zip, not the exe. Verify the exe with its hash, and the signature once releases are signed.
+- **Grants are narrow by default.** Only the detected user gets access. `-GrantAllUsers` is opt-in.
+- **`-ExecutionPolicy Bypass`** only appears in the batch launcher and only affects that one PowerShell process. The exe does not need it.
+- **diskpart commands** go over stdin. If that fails they go into a randomly named file in `%SystemRoot%\Temp`, created with create-new semantics so a file planted under the same name cannot be reused. That folder lets standard users create files but not open each other's, so this is narrower than the user's own `%TEMP%`.
+
+## Verifying a download
+
+Each release has `SHA256SUMS.txt` and a build provenance attestation.
+
+```powershell
+Get-FileHash .\VHDOneClick.exe -Algorithm SHA256
+```
+
+Compare against the line in `SHA256SUMS.txt`. The attestation ties the exe to the exact workflow run and commit that built it, and you can check it on the release's Attestations page or with GitHub's CLI if you have it.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). Releases built before signing was approved are unsigned and say so in their notes.
+
+- Committers and reviewers: [rimoldetech](https://github.com/rimoldetech)
+- Approvers: [rimoldetech](https://github.com/rimoldetech)
+
+Only binaries built by this repository's GitHub Actions from this repository's source are signed.
+
+**Privacy policy:** this program does not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 ## Troubleshooting
 
-**"No VHD/VHDX file found in this folder"**
-The scripts or `.exe` must be in the same folder as the image file. Move them to the same location and try again.
+**"No VHD/VHDX file found"**
+The exe or scripts have to be in the same folder as the image. Or pass `-Image`.
 
-**"Failed to mount image"**
-The file may be open by another process or damaged. Make sure nothing else has the image open and try again.
+**"The image changed since this diff was created. Run with -Reset."**
+Something wrote to the image after the diff was made, so the diff no longer matches. `-Reset` throws the diff away and makes a new one. Anything saved into the old diff is gone.
 
-**"No Primary partition found"**
-The image may use MBR-style partitioning rather than GPT. Please open an issue with details about how the source image was created.
+**"Volume X: is BitLocker-locked"**
+Double-click the drive in Explorer and enter the password or recovery key, or run `manage-bde -unlock X: -RecoveryPassword <key>`. Then run the tool again with `-Mount` to finish the permission pass.
 
-**"No free drive letters available"**
-All letters D through Z are in use on the host machine. Disconnect an unused drive or network share to free one up, then try again.
+**"Signature collision and the disk ID could not be changed"**
+You are mounting the image on the machine it came from and the fix did not work. Mount it on a different machine, or open an issue with the log.
 
-**Folders still show as inaccessible after first run**
-Delete the `.diff.vhdx.perms_done` sentinel file and the `.diff.vhdx` differencing disk, then run again. This forces the ownership and permission fix to re-run from scratch against a fresh diff disk.
+**"No free drive letters"**
+D through Z are all taken. Disconnect a drive or network share.
 
----
+**Some folders still prompt**
+The console printed a failure count, and the log has the paths. Run the tool again with `-Mount`, which retries. If the same folders keep failing, run with `-Deep`. If that fails too, run with `-Reset` and open an issue with the log.
+
+**Windows Defender or SmartScreen flags the exe**
+PS2EXE output gets flagged more often than most programs, since its launcher stub is common in malware. Check the hash, use the scripts zip, or report the false positive to Microsoft. Signed releases flag far less.
+
+## Building
+
+GitHub Actions does it. `.github/workflows/ci.yml` lints, tests and builds on every push. `.github/workflows/release.yml` runs on a `v*.*.*` tag and publishes the release. See `maintenance.md` for the release checklist.
+
+To build locally on Windows:
+
+1. `powershell -NoProfile -File tools\Install-BuildTools.ps1`, since this installs the pinned ps2exe, Pester and PSScriptAnalyzer.
+2. `powershell -NoProfile -File tools\Invoke-Checks.ps1`
+3. `powershell -NoProfile -File tools\Build.ps1 -Version 2.0.0-local -OutDir out`
+4. From an elevated prompt: `powershell -NoProfile -File tests\Integration.ps1 -Exe out\VHDOneClick.exe`
+
+Now `out\` holds `VHDOneClick.exe` and `VHDOneClick-scripts.zip`, the same as a release minus signing.
 
 ## License
 

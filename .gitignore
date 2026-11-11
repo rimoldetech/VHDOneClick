@@ -1,2 +1,8 @@
 VHDOneClick.exe
 VHDOneClick.exe.sha256
+build/
+out/
+signed/
+testResults.xml
+release-notes.md
+VHDOneClick-logs/

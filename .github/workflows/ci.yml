@@ -1,0 +1,51 @@
+name: CI
+
+# Lint, unit tests and a test build on every push and pull request.
+# No release. The exe is uploaded as a workflow artifact.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-build:
+    runs-on: windows-latest
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install pinned modules
+        shell: powershell
+        run: .\tools\Install-BuildTools.ps1
+
+      - name: Hygiene, lint, unit tests
+        shell: powershell
+        run: .\tools\Invoke-Checks.ps1
+
+      - name: Build
+        shell: powershell
+        run: |
+          $short = '${{ github.sha }}'.Substring(0, 7)
+          .\tools\Build.ps1 -Version "0.0.0-ci.$short" -OutDir out
+
+      - name: Smoke test
+        shell: powershell
+        run: |
+          $out = & .\out\VHDOneClick.exe -ShowVersion
+          $code = $LASTEXITCODE
+          Write-Output $out
+          if ($code -ne 0) { throw "VHDOneClick.exe -ShowVersion exited $code" }
+
+      # actions/upload-artifact v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: VHDOneClick-ci-${{ github.sha }}
+          path: |
+            out/VHDOneClick.exe
+            out/VHDOneClick-scripts.zip
+            testResults.xml
+          retention-days: 14

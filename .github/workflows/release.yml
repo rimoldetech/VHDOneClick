@@ -1,0 +1,149 @@
+name: Release
+
+# Push a tag like v2.0.0 (or v2.1.0-rc1 for a pre-release) to build, test,
+# sign when SignPath is configured, attest, and publish a GitHub release.
+#
+# Optional settings (Settings > Secrets and variables > Actions):
+#   secret   SIGNPATH_API_TOKEN
+#   variable SIGNPATH_ORGANIZATION_ID
+#   variable SIGNPATH_PROJECT_SLUG        (default: VHDOneClick)
+#   variable SIGNPATH_SIGNING_POLICY_SLUG (default: release-signing)
+#   variable SKIP_INTEGRATION = true      only if hosted runners cannot mount VHDX
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?)$') { throw "Tag $env:TAG is not vX.Y.Z or vX.Y.Z-suffix" }
+          $version = $Matches[1]
+          $pre = if ($version -match '-(rc|beta)') { 'true' } else { 'false' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
+          Write-Output "Version $version, prerelease $pre"
+
+      - name: Install pinned modules
+        shell: powershell
+        run: .\tools\Install-BuildTools.ps1
+
+      - name: Hygiene, lint, unit tests
+        shell: powershell
+        run: .\tools\Invoke-Checks.ps1
+
+      - name: Build
+        shell: powershell
+        run: .\tools\Build.ps1 -Version '${{ steps.ver.outputs.version }}' -OutDir out
+
+      - name: Smoke test
+        shell: powershell
+        run: |
+          $out = & .\out\VHDOneClick.exe -ShowVersion
+          $code = $LASTEXITCODE
+          Write-Output $out
+          if ($code -ne 0) { throw "VHDOneClick.exe -ShowVersion exited $code" }
+          if (($out -join ' ') -notmatch [regex]::Escape('${{ steps.ver.outputs.version }}')) { throw 'Version stamp missing from the exe' }
+
+      - name: Integration test
+        if: vars.SKIP_INTEGRATION != 'true'
+        shell: powershell
+        run: .\tests\Integration.ps1 -Exe "$PWD\out\VHDOneClick.exe"
+
+      # actions/upload-artifact v7.0.2
+      - name: Upload unsigned exe for signing
+        id: unsigned
+        if: env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: VHDOneClick-unsigned
+          path: out/VHDOneClick.exe
+          retention-days: 1
+
+      # signpath/github-action-submit-signing-request v3.0
+      - name: Sign with SignPath
+        id: sign
+        if: steps.unsigned.outcome == 'success'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'VHDOneClick' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Use signed exe
+        id: signed
+        if: steps.sign.outcome == 'success'
+        shell: powershell
+        run: |
+          Copy-Item -LiteralPath signed\VHDOneClick.exe -Destination out\VHDOneClick.exe -Force
+          $sig = Get-AuthenticodeSignature -LiteralPath out\VHDOneClick.exe
+          if ($sig.Status -ne 'Valid') { throw "Signature status is $($sig.Status)" }
+          Write-Output ('Signed by: ' + $sig.SignerCertificate.Subject)
+          & .\out\VHDOneClick.exe -ShowVersion
+          if ($LASTEXITCODE -ne 0) { throw 'Signed exe failed -ShowVersion' }
+          "signed=true" >> $env:GITHUB_OUTPUT
+
+      - name: Hashes
+        shell: pwsh
+        run: |
+          Set-Location out
+          $lines = foreach ($f in 'VHDOneClick.exe', 'VHDOneClick-scripts.zip') {
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant(), $f
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS.txt'), (($lines -join "`n") + "`n"))
+          Get-Content SHA256SUMS.txt
+
+      # actions/attest-build-provenance v4.2.2
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: |
+            out/VHDOneClick.exe
+            out/VHDOneClick-scripts.zip
+
+      - name: Release notes
+        shell: pwsh
+        run: |
+          $signedArg = @()
+          if ('${{ steps.signed.outputs.signed }}' -eq 'true') { $signedArg = @('-Signed') }
+          ./tools/New-ReleaseNotes.ps1 -Tag $env:TAG -OutFile release-notes.md -HashFile out/SHA256SUMS.txt @signedArg
+          Get-Content release-notes.md
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseArgs = @('release', 'create', $env:TAG,
+            'out/VHDOneClick.exe', 'out/VHDOneClick-scripts.zip', 'out/SHA256SUMS.txt',
+            '--title', "VHDOneClick $env:TAG", '--notes-file', 'release-notes.md', '--verify-tag')
+          if ('${{ steps.ver.outputs.prerelease }}' -eq 'true') { $releaseArgs += '--prerelease' }
+          & gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
