@@ -64,3 +64,4 @@ if ($problems.Count -gt 0) {
     exit 1
 }
 Write-Output ('OK: {0} PowerShell file(s) checked.' -f $files.Count)
+exit 0
